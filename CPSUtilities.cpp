@@ -3,8 +3,6 @@
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
- * Copyright (c) 1999-2003 Apple Computer, Inc.  All Rights Reserved.
- * 
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -552,7 +550,15 @@ DEBUGLOG( "for levelIndex" );
 
 			socketList = (int *) calloc( servCount, sizeof(int) );
 			
-			GetTrialTime( servCount, &timeout );
+			if ( levelIndex == kReplicaIPSet_LocallyHosted )
+			{
+				timeout.tv_sec = 10;
+				timeout.tv_usec = 0;
+			}
+			else
+			{
+				GetTrialTime( servCount, &timeout );
+			}
 			
 			for ( servIndex = 0; servIndex < servCount; servIndex++ )
 			{
@@ -636,6 +642,12 @@ DEBUGLOG( "for servIndex" );
 				fd_set fdset;
 				struct timeval selectTimeout = { 0, 750000 };
 				
+				if ( levelIndex == kReplicaIPSet_LocallyHosted )
+				{
+					selectTimeout.tv_sec = 10;
+					selectTimeout.tv_usec = 0;
+				}    
+			
 				bzero( &cin, sizeof(cin) );
 				cin.sin_family = AF_INET;
 				cin.sin_addr.s_addr = htonl( INADDR_ANY );
@@ -690,8 +702,6 @@ DEBUGLOG( "for servIndex3" );
 			if ( servCount == 1 )
 				break;
 		}
-		
-DEBUGLOG( "out" );
 	}
 	catch( long error )
 	{

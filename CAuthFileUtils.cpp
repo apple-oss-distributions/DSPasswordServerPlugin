@@ -3,8 +3,6 @@
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
- * Copyright (c) 1999-2003 Apple Computer, Inc.  All Rights Reserved.
- * 
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -47,11 +45,11 @@ void
 CAuthFileUtils::getGMTime(struct tm *inOutGMT)
 {
     time_t theTime;
-    struct tm *gmt;
+    struct tm gmt;
     
-    time(&theTime);
-    gmt = gmtime(&theTime);
-    memcpy( inOutGMT, gmt, sizeof(struct tm) );
+    ::time(&theTime);
+    ::gmtime_r(&theTime, &gmt);
+    memcpy( inOutGMT, &gmt, sizeof(struct tm) );
 }
 
 
@@ -193,6 +191,7 @@ CAuthFileUtils::DESAutoDecode(const void *key, void *data)
 			break;
 	}
 }
+
 
 
 
