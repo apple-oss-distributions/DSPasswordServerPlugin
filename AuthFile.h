@@ -141,7 +141,16 @@ typedef struct PasswordDigest {
     char digest[256];
 } PasswordDigest;
 
+#if TARGET_RT_BIG_ENDIAN
+	#define GlobalHistoryCount(A)			(A).historyCount
+	#define SetGlobalHistoryCount(A, B)		(A).historyCount = (B)
+#else
+	#define GlobalHistoryCount(A)			((A).hcLowBits | ((A).hcHighBit << 3))
+	#define SetGlobalHistoryCount(A, B)		{(A).hcLowBits = ((B) & 0x07); (A).hcHighBit = (((B) & 0x08) != 0);}
+#endif
+
 typedef struct PWGlobalAccessFeatures {
+#if TARGET_RT_BIG_ENDIAN
     unsigned int usingHistory:1;			// TRUE == users have password history files
     unsigned int usingExpirationDate:1;		// TRUE == look at expirationDateGMT
     unsigned int usingHardExpirationDate:1; // TRUE == look at hardExpirationDateGMT
@@ -157,8 +166,29 @@ typedef struct PWGlobalAccessFeatures {
 	unsigned int requiresMixedCase:1;		// TRUE == password must have one char in [A-Z], and one char in [a-z]
 	unsigned int newPasswordRequired:1;		// TRUE == new users must change their passwords on first login
 	unsigned int noModifyPasswordforSelf:1;	// TRUE == users cannot change their own passwords.
-	int unused:2;
-    
+	
+	// db 1.3
+	unsigned int requiresSymbol:1;
+	unsigned int unused:1;
+#else
+	// unfortunately, <historyCount> crosses a byte boundary so there needs to be some post-processing
+	// for this struct.
+	unsigned int hcHighBit:1;
+    unsigned int passwordCannotBeName:1;
+    unsigned int passwordIsHash:1;
+    unsigned int requiresNumeric:1;			// TRUE == password must have one char in [0-9]
+    unsigned int requiresAlpha:1;			// TRUE == password must have one char in [A-Z], [a-z]
+    unsigned int usingHardExpirationDate:1; // TRUE == look at hardExpirationDateGMT
+    unsigned int usingExpirationDate:1;		// TRUE == look at expirationDateGMT
+    unsigned int usingHistory:1;			// TRUE == users have password history files
+	unsigned int unused:1;
+	unsigned int requiresSymbol:1;
+	unsigned int noModifyPasswordforSelf:1;	// TRUE == users cannot change their own passwords.
+	unsigned int newPasswordRequired:1;		// TRUE == new users must change their passwords on first login
+	unsigned int requiresMixedCase:1;		// TRUE == password must have one char in [A-Z], and one char in [a-z]
+	unsigned int hcLowBits:3;
+#endif
+
     BSDTimeStructCopy expirationDateGMT;	// if exceeded, user is required to change the password at next login
 	BSDTimeStructCopy hardExpireDateGMT;	// if exceeded, user is disabled
     
@@ -178,6 +208,7 @@ typedef struct PWGlobalMoreAccessFeatures {
 } PWGlobalMoreAccessFeatures;
 
 typedef struct PWAccessFeatures {
+#if TARGET_RT_BIG_ENDIAN
     int isDisabled:1;						// TRUE == cannot log in
     int isAdminUser:1;						// TRUE == can modify other slots in the db
     int newPasswordRequired:1;				// TRUE == user is required to change the password at next login
@@ -193,6 +224,21 @@ typedef struct PWAccessFeatures {
 	int passwordCannotBeName:1;
 	unsigned int historyCount:4;
 	int isSessionKeyAgent:1;				// the user can retrieve (MPPE) session keys
+#else
+    int requiresAlpha:1;					// TRUE == password must have one char in [A-Z], [a-z]
+    int usingHardExpirationDate:1;			// TRUE == look at hardExpirationDateGMT
+    int usingExpirationDate:1;				// TRUE == look at expirationDateGMT
+    int canModifyPasswordforSelf:1;			// TRUE == user can modify their own password
+    int usingHistory:1;						// TRUE == user has a password history file
+    int newPasswordRequired:1;				// TRUE == user is required to change the password at next login
+    int isAdminUser:1;						// TRUE == can modify other slots in the db
+    int isDisabled:1;						// TRUE == cannot log in
+	int isSessionKeyAgent:1;				// the user can retrieve (MPPE) session keys
+	unsigned int historyCount:4;
+	int passwordCannotBeName:1;
+	int passwordIsHash:1;
+    int requiresNumeric:1;					// TRUE == password must have one char in [0-9]
+#endif
     
     BSDTimeStructCopy expirationDateGMT;	// if exceeded, user is required to change the password at next login
 	BSDTimeStructCopy hardExpireDateGMT;	// if exceeded, user is disabled
@@ -213,11 +259,23 @@ typedef struct PWMoreAccessFeatures {
 	char userkey[64];							// random key for RC5
 	UInt32 logOffTime;							// SMB data store
 	UInt32 kickOffTime;							// SMB data store
-	int recordIsDead:1;							// death certificate for deleted user
-	int doNotReplicate:1;						// the password information does not get replicated
-	int doNotMerge:1; 							// used for restoring from backup
+	
+#if TARGET_RT_BIG_ENDIAN
+	unsigned int recordIsDead:1;				// death certificate for deleted user
+	unsigned int doNotReplicate:1;				// the password information does not get replicated
+	unsigned int doNotMerge:1; 					// used for restoring from backup
 	unsigned int requiresMixedCase:1;			// TRUE == password must have one char in [A-Z], and one char in [a-z]
-	int unused511:12; 							// reserved
+	unsigned int obfuscationCode:2;				// method of obfuscation for recoverable passwords
+	int unused511:10; 							// reserved
+#else
+	unsigned int unused510:2;
+	unsigned int obfuscationCode:2;				// method of obfuscation for recoverable passwords
+	unsigned int requiresMixedCase:1;			// TRUE == password must have one char in [A-Z], and one char in [a-z]
+	unsigned int doNotMerge:1; 					// used for restoring from backup
+	unsigned int doNotReplicate:1;				// the password information does not get replicated
+	unsigned int recordIsDead:1;				// death certificate for deleted user
+	int unused511:8; 							// reserved
+#endif
 } PWMoreAccessFeatures;
 
 typedef struct PWFileHeader {
@@ -262,7 +320,7 @@ typedef struct PWFileEntry {
     
     PWAccessFeatures access;					// password policy data determined by marketing
     
-    // WARNING: The following field is the key to the kindom. It should never, ever, ever,
+    // WARNING: The following field is the key to the kingdom. It should never, ever, ever,
     // ever, be sent across the network or dumped to any log file!!!!
     
     char passwordStr[512];						// the password
@@ -295,6 +353,8 @@ Boolean StringToPWAccessFeaturesExtra( const char *inString, PWAccessFeatures *i
 Boolean StringToPWAccessFeatures_GetValue( const char *inString, unsigned long *outValue );
 void CrashIfBuiltWrong(void);
 
+void pwsf_PreserveUnrepresentedPolicies( const char *inOriginalStr, int inMaxLen, char *inOutString );
+
 int pwsf_GetPublicKey( char *outPublicKey );
 int pwsf_GetPublicKeyFromFile( const char *inFile, char *outPublicKey );
 void pwsf_CreateReplicaFile( const char *inIPStr, const char *inDNSStr, const char *inPublicKey );
@@ -303,6 +363,9 @@ char* pwsf_GetPrincName( PWFileEntry *userRec );
 int pwsf_ShadowHashDataToArray( const char *inAAData, CFMutableArrayRef *outHashTypeArray );
 char * pwsf_ShadowHashArrayToData( CFArrayRef inHashTypeArray, long *outResultLen );
 void pwsf_AppendUTF8StringToArray( const char *inUTF8Str, CFMutableArrayRef inArray );
+void pwsf_EndianAdjustTimeStruct( BSDTimeStructCopy *inOutTimeStruct, int native );
+void pwsf_EndianAdjustPWFileHeader( PWFileHeader *inOutHeader, int native );
+void pwsf_EndianAdjustPWFileEntry( PWFileEntry *inOutEntry, int native );
 
 // in CAuthFileBase.cpp
 int pwsf_TestDisabledStatus( PWAccessFeatures *inAccess, PWGlobalAccessFeatures *inGAccess, struct tm *inCreationDate, struct tm *inLastLoginTime, UInt16 *inOutFailedLoginAttempts );

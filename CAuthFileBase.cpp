@@ -31,6 +31,9 @@
 #include <unistd.h>
 #include <openssl/err.h>
 
+#include <CoreServices/CoreServices.h>
+#include <TargetConditionals.h>
+
 #include "DSMutexSemaphore.h"
 #include "CAuthFileBase.h"
 #include "SASLCode.h"
@@ -47,8 +50,6 @@ extern "C" {
 #endif
 };
 
-#define kFixedDESKey			"1POTATO2potato3PotatoFOUR"
-//#define kFixedDESKey			"M&2y(V40"
 #define kFixedDESChunk			8
 #define kMaxWriteSuspendTime	2			// seconds
 #define kPWUserIDSize			4*sizeof(long)
@@ -217,13 +218,9 @@ CAuthFileBase::createPasswordFile(void)
         pwFileHeader.access.maxFailedLoginAttempts = 0;
         pwFileHeader.access.minChars = 0;
         pwFileHeader.access.maxChars = 0;
-
+		
         // write header
-        writeCount = fwrite( &pwFileHeader, sizeof(PWFileHeader), 1, pwFile );
-        if ( writeCount != 1 )
-        {
-            err = -1;
-        }
+		err = this->setHeader( &pwFileHeader );
         
         // write blank space
         if ( err == 0 )
@@ -556,6 +553,7 @@ CAuthFileBase::getHeader( PWFileHeader *outHeader, bool inCanUseCachedCopy )
 			
 			// This one is faster (Panther7A122)
 			readCount = pread( fileno(pwFile), outHeader, sizeof(PWFileHeader), 0 );
+			pwsf_EndianAdjustPWFileHeader( outHeader, 1 );
         }
         
 		if ( outHeader->signature == kPWFileSignature )
@@ -598,7 +596,7 @@ CAuthFileBase::setHeader( const PWFileHeader *inHeader )
 {
     int err = -1;
     long writeCount;
-    
+	
     if ( inHeader == NULL )
         return -1;
 	if ( inHeader->signature != kPWFileSignature )
@@ -618,7 +616,14 @@ CAuthFileBase::setHeader( const PWFileHeader *inHeader )
 				memcpy( &pwFileHeader, inHeader, sizeof(PWFileHeader) );
             
             // write to disk
+#if TARGET_RT_LITTLE_ENDIAN
+			PWFileHeader diskHeader = pwFileHeader;
+			pwsf_EndianAdjustPWFileHeader( &diskHeader, 0 );
+            writeCount = fwrite( &diskHeader, sizeof(PWFileHeader), 1, pwFile );
+			bzero( &diskHeader, sizeof(PWFileHeader) );
+#else
             writeCount = fwrite( &pwFileHeader, sizeof(PWFileHeader), 1, pwFile );
+#endif
             if ( writeCount != 1 )
             {
                 err = -1;
@@ -711,7 +716,7 @@ CAuthFileBase::loadRSAKeys( void )
         memcpy(cp, dbHeader.privateKey, len);
         
         /* Check that it is at least big enought to contain the ID string. */
-        if (len < strlen(AUTHFILE_ID_STRING) + 1) {
+        if (len < (int)sizeof(AUTHFILE_ID_STRING)) {
             syslog(LOG_INFO, "Bad key.");
             buffer_free(&buffer);
 			
@@ -1088,7 +1093,7 @@ CAuthFileBase::nextSlot(void)
 {
     long slot = 0;
     int err = -1;
-    off_t curpos;
+    off_t curpos = 0;
     long readCount;
     PWFileEntry dbEntry;
 	
@@ -1122,28 +1127,42 @@ CAuthFileBase::nextSlot(void)
         {
             // go look in the freelist
             freeListFile = fopen( kFreeListFilePath, "r+" );
-            if ( freeListFile )
+            if ( freeListFile != NULL )
             {
-                err = fseek( freeListFile, -sizeof(long), SEEK_END );
-                if ( err == 0 )
-                {
-                    curpos = ftell( freeListFile );
-                    readCount = fread( &slot, sizeof(long), 1, freeListFile );
-                    this->closeFreeListFile();
-                    if ( readCount == 1 )
-                    {
-                        // snip the one we used
-                        err = truncate( kFreeListFilePath, curpos );
+				pwWait();
+				do
+				{
+					err = fseek( freeListFile, -sizeof(long), SEEK_END );
+					if ( err == 0 )
+					{
+						curpos = ftell( freeListFile );
+						readCount = fread( &slot, sizeof(long), 1, freeListFile );
+						if ( readCount == 1 )
+						{
+							// snip the one we used
+							err = ftruncate( fileno(freeListFile), curpos );
+							if ( err == 0 )
+							{
+								// double-check that the slot is really free
+								err = this->getPasswordRec( slot, &dbEntry, false );
+								if ( err == 0 && !PWRecIsZero(dbEntry) )
+									err = -1;
+							}
+						}
+						else
+						{
+							err = -1;
+							break;
+						}
+					}
+				}
+				while ( err == -1 && curpos > 0 );
+				pwSignal();
+				this->closeFreeListFile();
                     }
-                    else
-                    {
-                        err = -1;
-                    }
-                }
-            }
-            
+			
             // if freelist is empty, expand the file
-            if ( err != 0 )
+            if ( err != 0 || slot == 0 )
             {
                 err = this->expandDatabase( kPWFileInitialSlots, &slot );
             }
@@ -1598,13 +1617,14 @@ CAuthFileBase::addPasswordAtSlotFast(PWFileEntry *passwordRec, long slot)
 //	Used to write to a specific slot.
 //----------------------------------------------------------------------------------------------------
 
+#if TARGET_RT_BIG_ENDIAN
 int
 CAuthFileBase::setPasswordAtSlot(PWFileEntry *passwordRec, long slot, bool obfuscate, bool setModDate)
 {
     long offset;
     int err = -1;
-    int writeCount;
-    unsigned int encodeLen;
+    int writeCount;	
+	unsigned int encodeLen;
 	
 	if ( fReadOnlyFileSystem )
 		return -1;
@@ -1633,12 +1653,12 @@ CAuthFileBase::setPasswordAtSlot(PWFileEntry *passwordRec, long slot, bool obfus
                     encodeLen = sizeof(passwordRec->passwordStr);
                 
 				if ( obfuscate )
-					fUtils.DESEncode(kFixedDESKey, passwordRec->passwordStr, encodeLen);
-					
+					fUtils.DESEncode( passwordRec->passwordStr, encodeLen);
+				
                 writeCount = fwrite( passwordRec, sizeof(PWFileEntry), 1, pwFile );
 				
                 if ( obfuscate )
-					fUtils.DESDecode(kFixedDESKey, passwordRec->passwordStr, encodeLen);
+					fUtils.DESDecode( passwordRec->passwordStr, encodeLen);
 				
 				if ( writeCount == 1 )
 					fflush( pwFile );
@@ -1656,7 +1676,64 @@ CAuthFileBase::setPasswordAtSlot(PWFileEntry *passwordRec, long slot, bool obfus
 
     return err;
 }
+#else
+int
+CAuthFileBase::setPasswordAtSlot(PWFileEntry *passwordRec, long slot, bool obfuscate, bool setModDate)
+{
+    long offset;
+    int err = -1;
+    int writeCount;
+    unsigned int encodeLen;
+	PWFileEntry diskPassRec = *passwordRec;
+	
+	if ( fReadOnlyFileSystem )
+		return -1;
+	
+    if ( slot > 0 )
+    {
+		if ( (unsigned long)slot > pwFileHeader.numberOfSlotsCurrentlyInFile )
+			return -1;
+		
+		if ( setModDate ) {
+			fUtils.getGMTime( (struct tm *)&diskPassRec.modificationDate );
+			memcpy( &passwordRec->modificationDate, &diskPassRec.modificationDate, sizeof(struct tm) );
+		}
+		
+        pwWait();
+        err = this->openPasswordFile( "r+", false );
+        if ( err == 0 && pwFile )
+        {
+            offset = fUtils.slotToOffset( slot );
+            
+            err = fseek( pwFile, offset, SEEK_SET );
+            if ( err == 0 )
+            {
+                //passwordRec->slot = slot;
+                encodeLen = strlen(passwordRec->passwordStr);
+                encodeLen += (kFixedDESChunk - (encodeLen % kFixedDESChunk));	
+                if ( encodeLen > sizeof(passwordRec->passwordStr) )
+                    encodeLen = sizeof(passwordRec->passwordStr);
+                
+				if ( obfuscate )
+					fUtils.DESEncode( diskPassRec.passwordStr, encodeLen );
+				
+				// endian adjust
+				pwsf_EndianAdjustPWFileEntry( &diskPassRec, 0 );
+                writeCount = fwrite( &diskPassRec, sizeof(PWFileEntry), 1, pwFile );
+				bzero( &diskPassRec, sizeof(PWFileEntry) );
+				
+				if ( writeCount == 1 )
+					fflush( pwFile );
+                else
+                    err = -1;
+            }
+        }
+        pwSignal();
+    }
 
+    return err;
+}
+#endif
 
 //----------------------------------------------------------------------------------------------------
 //	setPasswordAtSlotFast
@@ -1669,6 +1746,7 @@ CAuthFileBase::setPasswordAtSlot(PWFileEntry *passwordRec, long slot, bool obfus
 //	obfuscate is TRUE, but the password is not un-obfuscated.
 //----------------------------------------------------------------------------------------------------
 
+#if TARGET_RT_BIG_ENDIAN
 int
 CAuthFileBase::setPasswordAtSlotFast(PWFileEntry *passwordRec, long slot)
 {
@@ -1702,7 +1780,7 @@ CAuthFileBase::setPasswordAtSlotFast(PWFileEntry *passwordRec, long slot)
 				if ( encodeLen > sizeof(passwordRec->passwordStr) )
 					encodeLen = sizeof(passwordRec->passwordStr);
 								
-				fUtils.DESEncode(kFixedDESKey, passwordRec->passwordStr, encodeLen);
+				fUtils.DESEncode( passwordRec->passwordStr, encodeLen);
 					
 				writeCount = fwrite( passwordRec, sizeof(PWFileEntry), 1, pwFile );
 				if ( writeCount == 1 )
@@ -1716,7 +1794,13 @@ CAuthFileBase::setPasswordAtSlotFast(PWFileEntry *passwordRec, long slot)
 
 	return err;
 }
-
+#else
+int
+CAuthFileBase::setPasswordAtSlotFast(PWFileEntry *passwordRec, long slot)
+{
+	return this->setPasswordAtSlot(passwordRec, slot);
+}
+#endif
 
 #if 0
 // --------------------------------------------------------------------------------
@@ -1887,11 +1971,15 @@ CAuthFileBase::getPasswordRec(long slot, PWFileEntry *passRec, bool unObfuscate)
 					
 					err = -2;
 				}
+				else
+				{ 
+					pwsf_EndianAdjustPWFileEntry( passRec, 1 );
+				}
             }
             
             // recover the password
 			if ( unObfuscate && !PWRecIsZero(*passRec) )
-				fUtils.DESAutoDecode( kFixedDESKey, passRec->passwordStr );
+				fUtils.DESAutoDecode(  passRec->passwordStr );
         }
         pwSignal();
     }
@@ -1929,7 +2017,7 @@ CAuthFileBase::getValidPasswordRec(PWFileEntry *passwordRec, bool *outFromSpillB
 	}
 	else
 	{
-		err = this->getPasswordRecFromSpillBucket( passwordRec, &dbEntry );
+		err = this->getPasswordRecFromSpillBucket( passwordRec, &dbEntry, unObfuscate );
 		if ( err == 0 )
 		{
 			if ( passwordRec->time == dbEntry.time &&
@@ -2990,7 +3078,7 @@ int pwsf_ChangePasswordStatus( PWAccessFeatures *inAccess, PWGlobalAccessFeature
 //------------------------------------------------------------------------------------------------
 //	RequiredCharacterStatus
 //
-//	Returns: enum of Reposonse Codes (CAuthFileCPP.h)
+//	Returns: enum of Reposonse Codes (CAuthFileBase.h)
 //------------------------------------------------------------------------------------------------
 
 int
@@ -3003,7 +3091,7 @@ CAuthFileBase::RequiredCharacterStatus(PWFileEntry *inPasswordRec, const char *i
 //------------------------------------------------------------------------------------------------
 //	pwsf_RequiredCharacterStatus
 //
-//	Returns: enum of Reposonse Codes (CAuthFileCPP.h)
+//	Returns: enum of Reposonse Codes (CAuthFileBase.h)
 //------------------------------------------------------------------------------------------------
 
 int pwsf_RequiredCharacterStatus(PWAccessFeatures *access, PWGlobalAccessFeatures *inGAccess, const char *inUsername, const char *inPassword)
@@ -3014,6 +3102,7 @@ int pwsf_RequiredCharacterStatus(PWAccessFeatures *access, PWGlobalAccessFeature
     UInt16 maxChars = (access->maxChars > 0) ? access->maxChars : inGAccess->maxChars;
 	Boolean passwordCannotBeName = (access->passwordCannotBeName || inGAccess->passwordCannotBeName );
     UInt16 len;
+	int index;
 	
 	if ( inPassword == NULL )
 		return kAuthPasswordTooShort;
@@ -3035,7 +3124,7 @@ int pwsf_RequiredCharacterStatus(PWAccessFeatures *access, PWGlobalAccessFeature
     {
         Boolean hasAlpha = false;
         
-        for ( int index = 0; index < len; index++ )
+        for ( index = 0; index < len; index++ )
         {
             if ( isalpha(inPassword[index]) )
             {
@@ -3052,7 +3141,7 @@ int pwsf_RequiredCharacterStatus(PWAccessFeatures *access, PWGlobalAccessFeature
     {
         Boolean hasDecimal = false;
         
-        for ( int index = 0; index < len; index++ )
+        for ( index = 0; index < len; index++ )
         {
             if ( isdigit(inPassword[index]) )
             {
@@ -3072,7 +3161,7 @@ int pwsf_RequiredCharacterStatus(PWAccessFeatures *access, PWGlobalAccessFeature
 		
 		// disallow the smaller substring, case-insensitive
 		if ( strncasecmp( inPassword, inUsername, smallerLen ) == 0 )
-			return kAuthPasswordNeedsChange;
+			return kAuthPasswordCannotBeUsername;
 	}
 	
     return kAuthOK;
@@ -3151,6 +3240,13 @@ CAuthFileBase::ReenableStatus(PWFileEntry *inPasswordRec, unsigned long inGlobal
 }
 
 
+CAuthFileUtils*
+CAuthFileBase::GetUtilsObject( void )
+{
+	return &fUtils;
+}
+
+
 /*----------------------------------------------------------------------------------*/
 
 #pragma mark -
@@ -3158,7 +3254,7 @@ CAuthFileBase::ReenableStatus(PWFileEntry *inPasswordRec, unsigned long inGlobal
 #pragma mark -
 
 int
-CAuthFileBase::getPasswordRecFromSpillBucket(PWFileEntry *inRec, PWFileEntry *passRec)
+CAuthFileBase::getPasswordRecFromSpillBucket(PWFileEntry *inRec, PWFileEntry *passRec, bool unObfuscate)
 {
 	PWFileEntry recBuff;
 	off_t offset = 0;
@@ -3167,7 +3263,6 @@ CAuthFileBase::getPasswordRecFromSpillBucket(PWFileEntry *inRec, PWFileEntry *pa
 	int err = -1;
 	char uidStr[35];
 	char buff[35];
-	unsigned int encodeLen;
 	
 	if ( inRec == NULL || passRec == NULL )
 		return -1;
@@ -3182,30 +3277,23 @@ CAuthFileBase::getPasswordRecFromSpillBucket(PWFileEntry *inRec, PWFileEntry *pa
 	do
 	{
 		byteCount = pread( fileno(fp), buff, sizeof(buff), offset );
-		
-		if ( strncmp( uidStr, buff, 34 ) == 0 )
+		if ( byteCount >= 34 && strncmp( uidStr, buff, 34 ) == 0 )
 		{
 			// found it
 			byteCount = pread( fileno(fp), (char *)&recBuff, sizeof(recBuff), offset+34 );
-			
-			// for any endian
-			//fUtils.stringToPasswordRecRef( uidStr, recBuff );
-			
-			// recover the password
-            encodeLen = strlen(recBuff.passwordStr);
-            encodeLen += (kFixedDESChunk - (encodeLen % kFixedDESChunk));	
-            if ( encodeLen > sizeof(recBuff.passwordStr) )
-                encodeLen = sizeof(recBuff.passwordStr);
-            
-            fUtils.DESDecode(kFixedDESKey, recBuff.passwordStr, encodeLen);
-			
-			// copy the record
-			memcpy( passRec, &recBuff, sizeof(PWFileEntry) );
-			
-			// zero our copy
-			memset( &recBuff, 0, sizeof(recBuff) );
-			
-			err = 0;
+			if ( byteCount > 0 )
+			{
+				pwsf_EndianAdjustPWFileEntry( &recBuff, 1 );
+				if ( unObfuscate )
+					fUtils.DESAutoDecode( recBuff.passwordStr );
+				
+				// copy the record
+				memcpy( passRec, &recBuff, sizeof(PWFileEntry) );
+				
+				// zero our copy
+				bzero( &recBuff, sizeof(recBuff) );
+				err = 0;
+			}
 			break;
 		}
 		
@@ -3238,7 +3326,10 @@ CAuthFileBase::SaveOverflowRecord( PWFileEntry *inPasswordRec, bool obfuscate, b
 	char buff[35];
 	unsigned int encodeLen;
     int writeCount;
-    
+#if TARGET_RT_LITTLE_ENDIAN
+    PWFileEntry passRec;
+#endif
+
 	if ( inPasswordRec == NULL )
 		return -1;
 	
@@ -3261,7 +3352,7 @@ CAuthFileBase::SaveOverflowRecord( PWFileEntry *inPasswordRec, bool obfuscate, b
 		encodeLen = sizeof(inPasswordRec->passwordStr);
 	
 	if ( obfuscate )
-		fUtils.DESEncode(kFixedDESKey, inPasswordRec->passwordStr, encodeLen);
+		fUtils.DESEncode( inPasswordRec->passwordStr, encodeLen);
 	
 	err = -1;
 	do
@@ -3271,7 +3362,13 @@ CAuthFileBase::SaveOverflowRecord( PWFileEntry *inPasswordRec, bool obfuscate, b
 		if ( strncmp( uidStr, buff, 34 ) == 0 )
 		{
 			// found it
+#if TARGET_RT_LITTLE_ENDIAN
+			memcpy( &passRec, inPasswordRec, sizeof(PWFileEntry) );
+			pwsf_EndianAdjustPWFileEntry( &passRec, 0 );
+			byteCount = pwrite( fileno(fp), &passRec, sizeof(PWFileEntry), offset+34 );
+#else
 			byteCount = pwrite( fileno(fp), inPasswordRec, sizeof(PWFileEntry), offset+34 );
+#endif
 			err = 0;
 			break;
 		}
@@ -3300,7 +3397,7 @@ CAuthFileBase::SaveOverflowRecord( PWFileEntry *inPasswordRec, bool obfuscate, b
 	}
 	
 	if ( obfuscate )
-		fUtils.DESDecode(kFixedDESKey, inPasswordRec->passwordStr, encodeLen);
+		fUtils.DESDecode( inPasswordRec->passwordStr, encodeLen );
 	
 	fclose( fp );
 	
